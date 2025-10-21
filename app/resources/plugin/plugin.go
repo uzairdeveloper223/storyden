@@ -31,8 +31,8 @@ type Record struct {
 	StatusMessage  string
 	Details        map[string]any
 
-	// TODO: Invariant type?
-	StartedAt time.Time
+	ReportedState ReportedState
+	StartedAt     time.Time
 }
 
 type Loaded struct {

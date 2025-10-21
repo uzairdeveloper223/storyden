@@ -8,15 +8,18 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/Southclaws/fault"
 	"github.com/Southclaws/fault/fmsg"
 	"github.com/Southclaws/opt"
+	resource_plugin "github.com/Southclaws/storyden/app/resources/plugin"
 	"github.com/Southclaws/storyden/lib/plugin"
 	"github.com/puzpuzpuz/xsync/v4"
 	"github.com/rs/xid"
 	"github.com/tetratelabs/wazero"
+	"github.com/tetratelabs/wazero/imports/wasi_snapshot_preview1"
 )
 
 // TODO: Make this configurable in some way. Perhaps at the instance level or
@@ -36,9 +39,11 @@ type PluginSession struct {
 	logger *slog.Logger
 
 	// session run metadata
-	runType RunType // one-shot or background
-	running bool    // if background: is it running now
-	started time.Time
+	runType       RunType                       // one-shot or background
+	reportedState resource_plugin.ReportedState // current runtime state
+	stateMu       sync.RWMutex
+	started       time.Time
+	errorMessage  string
 
 	// plugin data
 	bin      []byte
@@ -47,6 +52,10 @@ type PluginSession struct {
 	// runtime
 	runtime wazero.Runtime
 	runner  *wazeroRunner
+
+	// lifecycle management
+	ctx    context.Context
+	cancel context.CancelFunc
 
 	// in/out comms
 	inchan          chan []byte
@@ -71,20 +80,50 @@ type RPCResponse struct {
 	Result any    `json:"result"`
 }
 
-func (s PluginSession) ID() plugin.ID {
+func (s *PluginSession) ID() plugin.ID {
 	return s.id
 }
 
-func (s PluginSession) GetStartedAt() opt.Optional[time.Time] {
-	if !s.running {
+func (s *PluginSession) GetReportedState() resource_plugin.ReportedState {
+	s.stateMu.RLock()
+	defer s.stateMu.RUnlock()
+	return s.reportedState
+}
+
+func (s *PluginSession) GetStartedAt() opt.Optional[time.Time] {
+	s.stateMu.RLock()
+	defer s.stateMu.RUnlock()
+
+	if s.reportedState != resource_plugin.ReportedStateActive {
 		return opt.NewEmpty[time.Time]()
 	}
 	return opt.New(s.started)
 }
 
-func (s PluginSession) Send(ctx context.Context, method string, params any) (any, error) {
-	if !s.running {
-		return nil, fault.New("plugin is not running")
+func (s *PluginSession) GetErrorMessage() string {
+	s.stateMu.RLock()
+	defer s.stateMu.RUnlock()
+	return s.errorMessage
+}
+
+func (s *PluginSession) setState(state resource_plugin.ReportedState, errMsg string) {
+	s.stateMu.Lock()
+	defer s.stateMu.Unlock()
+	s.reportedState = state
+	s.errorMessage = errMsg
+
+	if state == resource_plugin.ReportedStateActive && s.started.IsZero() {
+		s.started = time.Now()
+	}
+}
+
+func (s *PluginSession) Send(ctx context.Context, method string, params any) (any, error) {
+	s.stateMu.RLock()
+	state := s.reportedState
+	s.stateMu.RUnlock()
+
+	if state != resource_plugin.ReportedStateActive {
+		return nil, fault.Newf("plugin is not running (state: %s)", state)
 	}
 
 	if s.runType == RunTypeOnDemand {
@@ -139,20 +178,27 @@ func (s PluginSession) Send(ctx context.Context, method string, params any) (any
 	}
 }
 
-func (s *PluginSession) Stop() {
-	// Close channels to signal shutdown
+func (s *PluginSession) stop() {
+	s.setState(resource_plugin.ReportedStateInactive, "")
+
+	if s.cancel != nil {
+		s.cancel()
+	}
+
 	if s.inchan != nil {
 		close(s.inchan)
 	}
 	if s.outchan != nil {
 		close(s.outchan)
 	}
-
-	s.running = false
 }
 
-func (s *PluginSession) Start(ctx context.Context) error {
-	if s.running {
+func (s *PluginSession) start() error {
+	s.stateMu.RLock()
+	currentState := s.reportedState
+	s.stateMu.RUnlock()
+
+	if currentState == resource_plugin.ReportedStateActive {
 		return fault.New("plugin is already running")
 	}
 
@@ -160,12 +206,12 @@ func (s *PluginSession) Start(ctx context.Context) error {
 		return fault.New("only background plugins can be started")
 	}
 
-	ctx, cancel := context.WithCancel(ctx)
+	s.ctx, s.cancel = context.WithCancel(context.Background())
 
 	ir, iw := io.Pipe()
 	or, ow := io.Pipe()
 
-	errCh := make(chan error)
+	errCh := make(chan error, 1)
 
 	mc := wazero.NewModuleConfig().
 		WithStdin(ir).
@@ -173,19 +219,27 @@ func (s *PluginSession) Start(ctx context.Context) error {
 		WithStderr(os.Stderr) // TODO: Route error to persisted plugin logs
 
 	handleError := func(err error) {
-		fmt.Println("ERROR:", err)
+		s.logger.Error("plugin error", slog.Any("error", err))
+		s.setState(resource_plugin.ReportedStateError, err.Error())
 	}
 
 	go func() {
-		defer cancel()
+		defer s.cancel()
 
-		mod, err := s.runtime.InstantiateWithConfig(ctx, s.bin, mc)
+		closer, err := wasi_snapshot_preview1.Instantiate(s.ctx, s.runtime)
+		if err != nil {
+			errCh <- fault.Wrap(err, fmsg.With("failed to instantiate wasi"))
+			return
+		}
+		defer closer.Close(s.ctx)
+
+		mod, err := s.runtime.InstantiateWithConfig(s.ctx, s.bin, mc)
 		if err != nil {
 			errCh <- fault.Wrap(err, fmsg.With("failed to instantiate"))
 			return
 		}
 
-		if err := mod.Close(ctx); err != nil {
+		if err := mod.Close(s.ctx); err != nil {
 			errCh <- fault.Wrap(err, fmsg.With("failed to close plugin"))
 			return
 		}
@@ -225,7 +279,7 @@ func (s *PluginSession) Start(ctx context.Context) error {
 	go func() {
 		for {
 			select {
-			case <-ctx.Done():
+			case <-s.ctx.Done():
 				s.logger.Debug("writer: context cancelled",
 					slog.String("id", s.id.String()))
 				return
@@ -240,15 +294,19 @@ func (s *PluginSession) Start(ctx context.Context) error {
 		}
 	}()
 
+	s.setState(resource_plugin.ReportedStateActive, "")
+
 	for {
 		select {
-		case <-ctx.Done():
+		case <-s.ctx.Done():
 			s.logger.Debug("reader-proc: context cancelled",
 				slog.String("id", s.id.String()))
-			return ctx.Err()
+			s.setState(resource_plugin.ReportedStateInactive, "")
+			return s.ctx.Err()
 
 		case err := <-errCh:
 			s.logger.Error("plugin failed", slog.Any("error", err))
+			s.setState(resource_plugin.ReportedStateError, err.Error())
 			return err
 
 		case output := <-s.outchan:
@@ -286,7 +344,7 @@ func (s *PluginSession) Start(ctx context.Context) error {
 			case pending.respch <- response:
 				s.logger.Debug("send rpc response", slog.String("id", response.ID))
 
-			case <-ctx.Done():
+			case <-s.ctx.Done():
 				s.logger.Debug("context cancelled while waiting for response",
 					slog.String("id", s.id.String()),
 					slog.String("response_id", response.ID),

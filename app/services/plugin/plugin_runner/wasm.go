@@ -2,7 +2,6 @@ package plugin_runner
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"encoding/json"
 	"io"
@@ -11,6 +10,7 @@ import (
 	"github.com/Southclaws/fault"
 	"github.com/Southclaws/fault/fctx"
 	"github.com/Southclaws/fault/fmsg"
+	resource_plugin "github.com/Southclaws/storyden/app/resources/plugin"
 	"github.com/Southclaws/storyden/lib/plugin"
 	"github.com/puzpuzpuz/xsync/v4"
 	"github.com/rs/xid"
@@ -25,6 +25,9 @@ type Runner interface {
 	Validate(ctx context.Context, bin []byte) (*plugin.Manifest, error)
 	GetSession(ctx context.Context, id plugin.ID) (*PluginSession, error)
 	GetSessions(ctx context.Context) ([]*PluginSession, error)
+
+	StartPlugin(ctx context.Context, id plugin.ID) error
+	StopPlugin(ctx context.Context, id plugin.ID) error
 }
 
 func New(ctx context.Context, logger *slog.Logger) Runner {
@@ -61,6 +64,9 @@ func (w *wazeroRunner) Load(ctx context.Context, bin []byte) (*PluginSession, er
 		id:     key,
 		logger: w.logger,
 
+		runType:       RunTypeBackground,
+		reportedState: resource_plugin.ReportedStateInactive,
+
 		bin:      bin,
 		manifest: m,
 
@@ -83,7 +89,7 @@ func (w *wazeroRunner) Unload(ctx context.Context, id plugin.ID) error {
 		return fault.New("plugin session not found")
 	}
 
-	s.Stop()
+	s.stop()
 
 	w.sessions.Delete(id)
 	return nil
@@ -107,7 +113,7 @@ func (w *wazeroRunner) GetSessions(ctx context.Context) ([]*PluginSession, error
 }
 
 func (w *wazeroRunner) Validate(ctx context.Context, bin []byte) (*plugin.Manifest, error) {
-	o, err := w.runOnce(ctx, bin, nil)
+	o, err := w.readPluginManifest(ctx, bin)
 	if err != nil {
 		return nil, fault.Wrap(err, fmsg.With("failed to validate plugin"))
 	}
@@ -120,22 +126,60 @@ func (w *wazeroRunner) Validate(ctx context.Context, bin []byte) (*plugin.Manife
 	return &m, nil
 }
 
-func (w *wazeroRunner) runOnce(ctx context.Context, bin []byte, command any) ([]byte, error) {
-	ir, iw := io.Pipe()
-	buf := bytes.NewBuffer(nil)
-	done := make(chan struct{})
-	errCh := make(chan error, 2)
+func (w *wazeroRunner) StartPlugin(ctx context.Context, id plugin.ID) error {
+	sess, ok := w.sessions.Load(id)
+	if !ok {
+		return fault.New("plugin session not found")
+	}
 
-	mc := wazero.NewModuleConfig().
-		WithStdin(ir).
-		WithStdout(buf)
+	go func() {
+		if err := sess.start(); err != nil {
+			w.logger.Error("plugin start failed",
+				slog.String("id", id.String()),
+				slog.Any("error", err),
+			)
+		}
+	}()
+
+	return nil
+}
+
+func (w *wazeroRunner) StopPlugin(ctx context.Context, id plugin.ID) error {
+	sess, ok := w.sessions.Load(id)
+	if !ok {
+		return fault.New("plugin session not found")
+	}
+
+	sess.stop()
+
+	return nil
+}
+
+func (w *wazeroRunner) readPluginManifest(ctx context.Context, bin []byte) ([]byte, error) {
+	pr, pw := io.Pipe()
+	manifestCh := make(chan []byte, 1)
+	errCh := make(chan error, 1)
 
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
 	go func() {
-		defer close(done)
+		scanner := bufio.NewScanner(pr)
+		scanner.Split(bufio.ScanLines)
 
+		if scanner.Scan() {
+			manifestCh <- scanner.Bytes()
+		} else if err := scanner.Err(); err != nil {
+			errCh <- fault.Wrap(err, fmsg.With("failed to read manifest line"))
+		} else {
+			errCh <- fault.New("no output received from module: expected a manifest")
+		}
+	}()
+
+	mc := wazero.NewModuleConfig().
+		WithStdout(pw)
+
+	go func() {
 		mod, err := w.runtime.InstantiateWithConfig(ctx, bin, mc)
 		if err != nil {
 			errCh <- fault.Wrap(err, fmsg.With("failed to instantiate"))
@@ -144,58 +188,22 @@ func (w *wazeroRunner) runOnce(ctx context.Context, bin []byte, command any) ([]
 
 		if err := mod.Close(ctx); err != nil {
 			errCh <- fault.Wrap(err, fmsg.With("failed to close module"))
-			return
 		}
-
-		done <- struct{}{}
 	}()
 
-	if command != nil {
-		go func() {
-			defer iw.Close()
-
-			cb, err := json.Marshal(command)
-			if err != nil {
-				errCh <- fault.Wrap(err, fmsg.With("failed to encode command"))
-				return
-			}
-
-			_, err = iw.Write(cb)
-			if err != nil {
-				errCh <- fault.Wrap(err, fmsg.With("failed to write command to module"))
-				return
-			}
-		}()
-	}
-
 	select {
-	case <-done:
+	case manifest := <-manifestCh:
+		cancel()
+		pw.Close()
+		return manifest, nil
+
 	case err := <-errCh:
+		cancel()
+		pw.Close()
 		return nil, err
+
+	case <-ctx.Done():
+		pw.Close()
+		return nil, fault.Wrap(ctx.Err(), fmsg.With("context cancelled while reading manifest"))
 	}
-
-	// Shut down the plugin.
-	// TODO: Background plugins may try to init, we should do some
-	// kind of "start" RPC to allow booting up post manifest.
-	cancel()
-
-	outputs := [][]byte{}
-
-	s := bufio.NewScanner(buf)
-	s.Split(bufio.ScanLines)
-	for s.Scan() {
-		outputs = append(outputs, s.Bytes())
-	}
-
-	o := outputs[len(outputs)-1]
-
-	if len(outputs) == 0 {
-		if command == nil {
-			return nil, fault.New("no output received from module: expected a manifest")
-		} else {
-			return nil, fault.New("no output received from module: expected a command response")
-		}
-	}
-
-	return o, nil
 }

@@ -88,12 +88,25 @@ func (p *Plugins) PluginGet(ctx context.Context, request openapi.PluginGetReques
 }
 
 func (p *Plugins) PluginSetActiveState(ctx context.Context, request openapi.PluginSetActiveStateRequestObject) (openapi.PluginSetActiveStateResponseObject, error) {
-	// Call plugin runner, which will handle the active state change
-	// set active state in db
-	// re-build runner state
-	// register plugin events etc.
-	// set up for run once or run in background
-	return nil, nil
+	id := plugin.ID(deserialiseID(request.PluginInstanceId))
+	status, err := plugin.NewActiveState(string(request.Body.Active))
+	if err != nil {
+		return nil, fault.Wrap(err, fctx.With(ctx), ftag.With(ftag.InvalidArgument))
+	}
+
+	err = p.pm.SetActiveState(ctx, id, status)
+	if err != nil {
+		return nil, fault.Wrap(err, fctx.With(ctx))
+	}
+
+	record, err := p.pm.Get(ctx, plugin.ID(deserialiseID(request.PluginInstanceId)))
+	if err != nil {
+		return nil, fault.Wrap(err, fctx.With(ctx))
+	}
+
+	return openapi.PluginSetActiveState200JSONResponse{
+		PluginGetOKJSONResponse: openapi.PluginGetOKJSONResponse(serialisePlugin(record)),
+	}, nil
 }
 
 func serialisePlugin(in *plugin.Record) openapi.Plugin {
@@ -125,12 +138,13 @@ func serialisePluginStatus(in *plugin.Record) openapi.PluginStatus {
 			DeactivatedAt: in.StateChangedAt,
 		})
 
-	case plugin.ActiveStateError:
-		as.FromPluginStatusError(openapi.PluginStatusError{
-			ActiveState: openapi.Error,
-			Message:     in.StatusMessage,
-			Details:     in.Details,
-		})
+	// TODO: Expose actual session state, not active state.
+	// case plugin.ActiveStateError:
+	// 	as.FromPluginStatusError(openapi.PluginStatusError{
+	// 		ActiveState: openapi.Error,
+	// 		Message:     in.StatusMessage,
+	// 		Details:     in.Details,
+	// 	})
 
 	default:
 		as.FromPluginStatusError(openapi.PluginStatusError{

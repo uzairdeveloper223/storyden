@@ -2,6 +2,7 @@ package plugin_reader
 
 import (
 	"context"
+	"io"
 	"path/filepath"
 
 	"github.com/Southclaws/dt"
@@ -50,7 +51,6 @@ func (r *Reader) Get(ctx context.Context, id plugin.ID) (*plugin.Record, error) 
 		return nil, fault.Wrap(err, fctx.With(ctx))
 	}
 	if !exists {
-		rec.State = plugin.ActiveStateError
 		rec.StatusMessage = "Plugin file not found in storage"
 		rec.Details = map[string]any{
 			"expected_file_path": rec.FilePath,
@@ -84,9 +84,6 @@ func (r *Reader) List(ctx context.Context) ([]*plugin.Record, error) {
 			return path == r.FilePath
 		})
 		if !exists {
-			// NOTE: A bit of a mutative hack, these kinds of edge case error
-			// states are not currently easier to represent in the data model.
-			r.State = plugin.ActiveStateError
 			r.StatusMessage = "Plugin file not found in storage"
 			r.Details = map[string]any{
 				"expected_file_path": r.FilePath,
@@ -98,4 +95,23 @@ func (r *Reader) List(ctx context.Context) ([]*plugin.Record, error) {
 	})
 
 	return validated, nil
+}
+
+func (r *Reader) LoadBinary(ctx context.Context, id plugin.ID) ([]byte, error) {
+	rec, err := r.Get(ctx, id)
+	if err != nil {
+		return nil, fault.Wrap(err, fctx.With(ctx))
+	}
+
+	reader, _, err := r.store.Read(ctx, rec.FilePath)
+	if err != nil {
+		return nil, fault.Wrap(err, fctx.With(ctx), ftag.With(ftag.NotFound))
+	}
+
+	bin, err := io.ReadAll(reader)
+	if err != nil {
+		return nil, fault.Wrap(err, fctx.With(ctx))
+	}
+
+	return bin, nil
 }

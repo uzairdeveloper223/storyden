@@ -131,12 +131,9 @@ func (m *Manager) Get(ctx context.Context, id plugin.ID) (*plugin.Record, error)
 
 	sess, err := m.runner.GetSession(ctx, record.Manifest.ID)
 	if err != nil {
-		// TODO: Better distinguish between error paths.
-		// particularly around the state on the record (desired?) and runtime.
-		record.State = plugin.ActiveStateError
-		record.StatusMessage = "Plugin is not running"
+		record.StatusMessage = "Session not found"
 	} else {
-		hydrateSession(record, *sess)
+		hydrateSession(record, sess)
 	}
 
 	return record, nil
@@ -163,18 +160,19 @@ func (m *Manager) List(ctx context.Context) ([]*plugin.Record, error) {
 	// match up sessions to records
 	for _, record := range records {
 		if sess, ok := sessionMap[record.Manifest.ID]; ok {
-			hydrateSession(record, *sess)
+			hydrateSession(record, sess)
 		} else {
-			// TODO: If desired state is running, but session not here, mark as error?
-			record.StatusMessage = "Plugin is not running"
+			record.StatusMessage = "Session not found"
 		}
 	}
 
 	return records, nil
 }
 
-func hydrateSession(record *plugin.Record, sess plugin_runner.PluginSession) {
+func hydrateSession(record *plugin.Record, sess *plugin_runner.PluginSession) {
+	record.ReportedState = sess.GetReportedState()
 	record.StartedAt = sess.GetStartedAt().OrZero()
+	record.StatusMessage = sess.GetErrorMessage()
 }
 
 func (m *Manager) Delete(ctx context.Context, id plugin.ID) error {
