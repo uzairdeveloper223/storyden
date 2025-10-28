@@ -9,9 +9,7 @@ import (
 
 func Build() fx.Option {
 	return fx.Options(
-		fx.Provide(
-			plugin_manager.New,
-			plugin_runner.New,
-		),
+		fx.Provide(plugin_manager.New),
+		plugin_runner.Build(),
 	)
 }

@@ -19,21 +19,6 @@ import (
 	"github.com/tetratelabs/wazero/imports/wasi_snapshot_preview1"
 )
 
-type Runner interface {
-	Load(ctx context.Context, bin []byte) (*PluginSession, error)
-	Unload(ctx context.Context, id plugin.ID) error
-	Validate(ctx context.Context, bin []byte) (*plugin.Manifest, error)
-	GetSession(ctx context.Context, id plugin.ID) (*PluginSession, error)
-	GetSessions(ctx context.Context) ([]*PluginSession, error)
-
-	StartPlugin(ctx context.Context, id plugin.ID) error
-	StopPlugin(ctx context.Context, id plugin.ID) error
-}
-
-func New(ctx context.Context, logger *slog.Logger) Runner {
-	return newWazeroRunner(ctx, logger)
-}
-
 type wazeroRunner struct {
 	logger   *slog.Logger
 	runtime  wazero.Runtime
